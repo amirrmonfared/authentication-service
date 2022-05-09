@@ -8,6 +8,10 @@ import (
 	"os"
 	"time"
 
+	_ "github.com/jackc/pgconn"
+	_ "github.com/jackc/pgx/v4"
+	_ "github.com/jackc/pgx/v4/stdlib"
+
 	"github.com/amirrmonfared/authentication-service/data"
 )
 
@@ -23,10 +27,17 @@ type Config struct {
 func main() {
 	log.Println("starting authentication service")
 
-	//TODO connect to DB
+	//connect to DB
+	conn := connectToDB()
+	if conn == nil {
+		log.Panic("Can't connect to Postgres!")
+	}
 
 	//set up config
-	app := Config{}
+	app := Config{
+		DB:     conn,
+		Models: data.New(conn),
+	}
 
 	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%s", webPort),
