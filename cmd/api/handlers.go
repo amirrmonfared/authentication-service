@@ -2,41 +2,55 @@ package main
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+
+	db "github.com/amirrmonfared/testMicroServices/authentication-service/db/sqlc"
+	"github.com/gin-gonic/gin"
+	"golang.org/x/crypto/bcrypt"
 )
 
-func (app *Config) Authenticate(w http.ResponseWriter, r *http.Request) {
+type jsonResponse struct {
+	Error   bool   `json:"error"`
+	Message string `json:"message"`
+	Data    any    `json:"data,omitempty"`
+	LogID   any    `json:"log_id,omitempty"`
+}
+
+func (server *Server) Authenticate(ctx *gin.Context) {
 	var requestPayload struct {
 		Email    string `json:"email"`
 		Password string `json:"password"`
 	}
 
-	err := app.readJSON(w, r, &requestPayload)
-	if err != nil {
-		app.errorJSON(w, err, http.StatusBadRequest)
+	if err := ctx.ShouldBindJSON(&requestPayload); err != nil {
+		ctx.JSON(http.StatusBadRequest, errorResponse(err))
 		return
 	}
 
-	//validate the user against the database
-	user, err := app.Models.User.GetByEmail(requestPayload.Email)
+	user, err := server.store.GetByEmail(ctx, requestPayload.Email)
 	if err != nil {
-		app.errorJSON(w, errors.New("innvalid credintials"), http.StatusBadRequest)
+		if err == sql.ErrNoRows {
+			ctx.JSON(http.StatusNotFound, errorResponse(err))
+			return
+		}
+
+		ctx.JSON(http.StatusInternalServerError, errorResponse(err))
 		return
 	}
 
-	valid, err := user.PasswordMatches(requestPayload.Password)
+	valid, err := PasswordMatches(requestPayload.Password, user)
 	if err != nil || !valid {
-		app.errorJSON(w, errors.New("innvalid credintials"), http.StatusBadRequest)
+		ctx.JSON(http.StatusUnauthorized, errorResponse(err))
 		return
 	}
 
-	// log authentication
-	err = app.logRequest("authentication", fmt.Sprintf("%s logged in", user.Email))
+	resp, err := server.logRequest("authentication", fmt.Sprintf("%s logged in", user.Email), ctx)
 	if err != nil {
-		app.errorJSON(w, err)
+		ctx.JSON(http.StatusBadRequest, errorResponse(err))
 		return
 	}
 
@@ -44,13 +58,13 @@ func (app *Config) Authenticate(w http.ResponseWriter, r *http.Request) {
 		Error:   false,
 		Message: fmt.Sprintf("Logged in user %s", user.Email),
 		Data:    user,
+		LogID:   resp,
 	}
 
-	app.writeJSON(w, http.StatusAccepted, payload)
-
+	ctx.JSON(http.StatusAccepted, payload)
 }
 
-func (app *Config) logRequest(name, data string) error {
+func (server *Server) logRequest(name, data string, ctx *gin.Context) (any, error) {
 	var entry struct {
 		Name string `json:"name"`
 		Data string `json:"data"`
@@ -64,14 +78,46 @@ func (app *Config) logRequest(name, data string) error {
 
 	request, err := http.NewRequest("POST", logServiceURL, bytes.NewBuffer(jsonData))
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	client := &http.Client{}
-	_, err = client.Do(request)
+	resp, err := client.Do(request)
 	if err != nil {
-		return err
+		return "", err
 	}
 
-	return nil
+	defer resp.Body.Close()
+
+	// create a variable we'll read response.Body into
+	var jsonFromService jsonResponse
+
+	// decode the json from the auth service
+	err = json.NewDecoder(resp.Body).Decode(&jsonFromService)
+	if err != nil {
+		ctx.JSON(http.StatusBadRequest, err)
+		return "", err
+	}
+
+	logID := jsonFromService.LogID
+
+	return logID, nil
+}
+
+// PasswordMatches uses Go's bcrypt package to compare a user supplied password
+// with the hash we have stored for a given user in the database. If the password
+// and hash match, we return true; otherwise, we return false.
+func PasswordMatches(plainText string, u db.User) (bool, error) {
+	err := bcrypt.CompareHashAndPassword([]byte(u.Password), []byte(plainText))
+	if err != nil {
+		switch {
+		case errors.Is(err, bcrypt.ErrMismatchedHashAndPassword):
+			// invalid password
+			return false, nil
+		default:
+			return false, err
+		}
+	}
+
+	return true, nil
 }
